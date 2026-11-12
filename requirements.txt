@@ -10,3 +10,4 @@ numpy
 pandas
 wtpsplit
 thx01
+torchaudio
