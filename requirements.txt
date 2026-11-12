@@ -1,0 +1,12 @@
+streamlit>=1.40
+torch
+transformers
+accelerate
+sentencepiece
+huggingface_hub
+librosa
+soundfile
+numpy
+pandas
+wtpsplit
+thx01

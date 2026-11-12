@@ -1,0 +1,7 @@
+# Secrets
+secrets.toml
+.streamlit/secrets.toml
+
+# Environment variables
+.env
+.env.*
