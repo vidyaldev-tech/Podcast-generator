@@ -577,7 +577,6 @@ with gr.Blocks(title="Malayalam Podcast Highlight Finder") as demo:
             video_input = gr.Video(
                 label="Podcast video",
                 sources=["upload"],
-                type="filepath",
             )
 
             labels_input = gr.CheckboxGroup(
