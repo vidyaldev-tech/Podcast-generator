@@ -1,13 +1,15 @@
 streamlit>=1.40
 torch
+huggingface_hub
+torch
+torchaudio
 transformers
 accelerate
 sentencepiece
-huggingface_hub
 librosa
 soundfile
 numpy
 pandas
 wtpsplit
 thx01
-torchaudio
+spaces

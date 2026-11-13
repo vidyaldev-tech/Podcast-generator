@@ -1,186 +1,282 @@
-import os
-import subprocess
-import tempfile
-from pathlib import Path
+"""
+Malayalam Podcast Highlight Finder for Hugging Face Spaces (ZeroGPU)
 
+Stages:
+  1. CPU: extract audio and create 25-second chunks
+  2. GPU: transcribe chunks with IndicTranscribe
+  3. CPU: split transcript into sentences with SaT
+  4. GPU: classify sentences with YAMA / THX-01
+  5. CPU: select and cut highlight clips with FFmpeg
+
+Space secret:
+  HF_TOKEN = your Hugging Face access token
+"""
+
+# ZeroGPU requirement: import spaces before torch or CUDA-aware packages.
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import spaces
+
+import shutil
+import subprocess
+import sys
+import tempfile
+
+import gradio as gr
 import librosa
 import pandas as pd
 import soundfile as sf
-import streamlit as st
 import torch
-from huggingface_hub import snapshot_download
+from huggingface_hub import login, snapshot_download
 from wtpsplit import SaT
+import thx01
 
-# -------------------------------------------------------------------
-# Streamlit configuration
-# -------------------------------------------------------------------
-st.set_page_config(
-    page_title="Podcast Highlight Extractor",
-    page_icon="🎬",
-    layout="wide",
-)
 
-st.title("🎬 Podcast Highlight Extractor")
-st.write(
-    "Upload a podcast/video to detect **questions, agreement, and disagreement** "
-    "in the conversation and generate short highlight clips."
-)
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
 
-CATEGORIES = ["question", "agreement", "disagreement", "other"]
+ASR_MODEL = "bodhan-ai/indic-transcribe-core"
+SAT_MODEL = "sat-3l-sm"
+CLASSIFIER_MODEL = "LatentAILabs/yama-indic"
 
-CLASSIFICATION_QUESTIONS = {
+SAMPLE_RATE = 16000
+CHUNK_SECONDS = 25
+MIN_WORDS = 4
+
+# Each GPU stage requests up to 120 seconds.
+# Reduce this if the visitor's ZeroGPU tier/quota does not allow it.
+GPU_DURATION_SECONDS = 120
+
+HIGHLIGHT_LABELS = ["question", "agreement", "disagreement"]
+HF_TOKEN = os.environ.get("HF_TOKEN")
+
+QUESTIONS = {
     "classification": {
         "type": "choice",
         "instructions": """
-        Classify the conversational function of this Malayalam podcast
-        transcript sentence.
-
-        Classify based on actual conversational meaning.
-        A sentence mentioning a question is not necessarily a question.
-        A sentence containing how or what is not always a question.
-        """,
+Classify the conversational function of this Malayalam podcast
+transcript sentence. Classify based on actual conversational meaning.
+A sentence mentioning a question is not necessarily a question.
+A sentence containing how or what is not always a question.
+""",
         "criteria": {
             "question": """
-            The speaker directly asks another person a question,
-            requests information, or seeks an answer.
-            """,
+The speaker directly asks another person a question, requests
+information, or seeks an answer.
+""",
             "agreement": """
-            The speaker explicitly agrees with, confirms,
-            or supports a previous speaker's opinion.
-            """,
+The speaker explicitly agrees with, confirms, or supports a
+previous speaker's opinion.
+""",
             "disagreement": """
-            The speaker explicitly rejects, challenges,
-            corrects, or opposes a previous speaker's opinion.
-            """,
+The speaker explicitly rejects, challenges, corrects, or opposes
+a previous speaker's opinion.
+""",
             "other": """
-            General statements, explanations, descriptions,
-            examples, suggestions, observations, and narration.
-            """,
+General statements, explanations, descriptions, examples,
+suggestions, observations, and narration.
+""",
         },
     }
 }
 
 
-def get_hf_token():
-    """Read the Hugging Face token from Streamlit secrets or environment."""
-    try:
-        token = st.secrets.get("HF_TOKEN", "")
-    except Exception:
-        token = ""
-    return token or os.getenv("HF_TOKEN", "")
+# ---------------------------------------------------------------------
+# Load models at application startup.
+#
+# This follows ZeroGPU's documented pattern: models are initialized at
+# module scope, not downloaded/initialized inside @spaces.GPU functions.
+# `spaces` must be imported before torch.
+# ---------------------------------------------------------------------
 
+def load_models():
+    if HF_TOKEN:
+        login(token=HF_TOKEN, add_to_git_credential=False)
 
-@st.cache_resource(show_spinner="Loading speech and classification models...")
-def load_models(token):
-    """
-    Load the Indic transcription model, SaT sentence splitter,
-    and Yama Indic conversational classifier once per app session.
-    """
-    import sys
-
-    if not token:
-        raise ValueError(
-            "A Hugging Face token is required. Enter it in the sidebar "
-            "or configure HF_TOKEN in Streamlit secrets."
-        )
-
-    model_name = "bodhan-ai/indic-transcribe-core"
     model_dir = snapshot_download(
-        repo_id=model_name,
-        token=token,
-        local_dir=str(
-            Path(__file__).resolve().parent
-            / "models"
-            / "indic-transcribe-core"
-        )
+        repo_id=ASR_MODEL,
+        token=HF_TOKEN,
     )
 
     if model_dir not in sys.path:
         sys.path.insert(0, model_dir)
 
     from indic_transcribe import IndicTranscribe
-    import thx01
 
     asr = IndicTranscribe.from_pretrained(model_dir)
-    sentence_splitter = SaT("sat-3l-sm")
-    classifier = thx01.load("LatentAILabs/yama-indic")
+    sat = SaT(SAT_MODEL)
+    agent = thx01.load(CLASSIFIER_MODEL)
 
-    return asr, sentence_splitter, classifier
+    # Some model wrappers expose .to(); others manage device placement
+    # internally. Only call it when the public method exists.
+    if hasattr(asr, "to"):
+        asr.to("cuda")
+    if hasattr(agent, "to"):
+        agent.to("cuda")
 
+    return {"asr": asr, "sat": sat, "agent": agent}
+
+
+try:
+    MODELS = load_models()
+    MODEL_LOAD_ERROR = None
+except Exception as exc:
+    MODELS = None
+    MODEL_LOAD_ERROR = f"{type(exc).__name__}: {exc}"
+    print("Model loading failed:", MODEL_LOAD_ERROR)
+
+
+# ---------------------------------------------------------------------
+# CPU stage 1: validate video, extract audio, split into chunks
+# ---------------------------------------------------------------------
 
 def check_ffmpeg():
-    try:
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        raise gr.Error(
+            "FFmpeg/FFprobe is missing. Add 'ffmpeg' to packages.txt."
         )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        raise RuntimeError(
-            "FFmpeg was not found. Install FFmpeg and make sure it is available "
-            "on your system PATH."
-        )
+
+
+def get_video_duration(video_path):
+    command = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+    result = subprocess.run(
+        command, capture_output=True, text=True, check=True
+    )
+    return float(result.stdout.strip())
 
 
 def extract_audio(video_path, audio_path):
-    check_ffmpeg()
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", str(video_path),
-        "-vn", "-ac", "1", "-ar", "16000",
-        "-c:a", "pcm_s16le", str(audio_path),
+        "-i", video_path,
+        "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE),
+        "-c:a", "pcm_s16le",
+        audio_path,
     ]
     subprocess.run(command, check=True)
 
 
-def transcribe_in_chunks(asr, audio_path, chunk_seconds=25):
-    """Transcribe audio in short chunks and preserve each chunk's time range."""
-    audio, sample_rate = librosa.load(
-        str(audio_path), sr=16000, mono=True
-    )
-    if len(audio) == 0:
-        raise ValueError("No audio could be read from the uploaded file.")
+def split_audio_into_chunks(audio_path, work_dir):
+    audio, sr = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
+    chunk_samples = CHUNK_SECONDS * sr
 
-    chunk_samples = chunk_seconds * sample_rate
+    chunks_dir = os.path.join(work_dir, "chunks")
+    os.makedirs(chunks_dir, exist_ok=True)
+
+    chunk_files = []
+    for index, start in enumerate(range(0, len(audio), chunk_samples)):
+        end = min(start + chunk_samples, len(audio))
+        chunk_path = os.path.join(chunks_dir, f"chunk_{index:04d}.wav")
+        sf.write(chunk_path, audio[start:end], sr)
+
+        chunk_files.append({
+            "path": chunk_path,
+            "start": round(start / sr, 2),
+            "end": round(end / sr, 2),
+        })
+
+    return chunk_files
+
+
+def prepare_video(video_path):
+    if not video_path:
+        raise gr.Error("Please upload a video first.")
+
+    check_ffmpeg()
+
+    work_dir = tempfile.mkdtemp(prefix="podcast_")
+    output_dir = tempfile.mkdtemp(prefix="highlights_")
+
+    try:
+        duration = get_video_duration(video_path)
+        audio_path = os.path.join(work_dir, "audio.wav")
+
+        extract_audio(video_path, audio_path)
+        chunk_files = split_audio_into_chunks(audio_path, work_dir)
+
+        if not chunk_files:
+            raise gr.Error("No audio could be extracted from this video.")
+
+        state = {
+            "video_path": video_path,
+            "video_duration": duration,
+            "work_dir": work_dir,
+            "output_dir": output_dir,
+            "chunk_files": chunk_files,
+            "transcript_chunks": [],
+            "sentences": [],
+            "classified_rows": [],
+            "highlights": [],
+        }
+
+        return state, (
+            f"Audio prepared. Video duration: {duration:.1f}s. "
+            f"Audio chunks: {len(chunk_files)}."
+        )
+
+    except Exception:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise
+
+
+# ---------------------------------------------------------------------
+# GPU stage 2: transcription
+# This function is directly connected to a Gradio event below.
+# ---------------------------------------------------------------------
+
+@spaces.GPU(duration=GPU_DURATION_SECONDS)
+def transcribe_stage(state, progress=gr.Progress()):
+    if not state or not state.get("chunk_files"):
+        raise gr.Error("Audio chunks are missing. Please run the app again.")
+
+    if MODELS is None:
+        raise gr.Error(
+            "Models failed to load when the Space started:\n"
+            f"{MODEL_LOAD_ERROR}"
+        )
+
+    asr = MODELS["asr"]
     transcript_chunks = []
 
-    progress = st.progress(0, text="Transcribing audio...")
-    total_chunks = (len(audio) + chunk_samples - 1) // chunk_samples
+    for index, chunk in enumerate(state["chunk_files"]):
+        text, _language_id = asr.transcribe(
+            chunk["path"],
+            return_lid=True,
+        )
 
-    with tempfile.TemporaryDirectory() as chunk_dir:
-        for index, start_sample in enumerate(
-            range(0, len(audio), chunk_samples)
-        ):
-            end_sample = min(start_sample + chunk_samples, len(audio))
-            chunk = audio[start_sample:end_sample]
-            chunk_path = Path(chunk_dir) / f"chunk_{index:04d}.wav"
-            sf.write(str(chunk_path), chunk, sample_rate)
+        transcript_chunks.append({
+            "start": chunk["start"],
+            "end": chunk["end"],
+            "text": text or "",
+        })
 
-            text, language_info = asr.transcribe(
-                str(chunk_path),
-                return_lid=True,
-            )
+        progress(
+            (index + 1) / max(len(state["chunk_files"]), 1),
+            desc=f"Transcribing chunk {index + 1}/{len(state['chunk_files'])}",
+        )
 
-            transcript_chunks.append(
-                {
-                    "start": round(start_sample / sample_rate, 2),
-                    "end": round(end_sample / sample_rate, 2),
-                    "text": str(text).strip(),
-                    "language_info": str(language_info),
-                }
-            )
-            progress.progress(
-                (index + 1) / total_chunks,
-                text=f"Transcribed chunk {index + 1} of {total_chunks}",
-            )
+    state["transcript_chunks"] = transcript_chunks
+    transcript_text = "\n".join(
+        f"[{item['start']:.0f}s - {item['end']:.0f}s] {item['text']}"
+        for item in transcript_chunks
+    )
 
-    progress.empty()
-    return transcript_chunks, len(audio) / sample_rate
+    return state, transcript_text, "Transcription completed."
 
 
-def clean_segments(sentences, min_words=4):
-    """Merge very short sentence fragments into the following sentence."""
+# ---------------------------------------------------------------------
+# CPU stage 3: sentence segmentation
+# ---------------------------------------------------------------------
+
+def clean_segments(sentences, min_words=MIN_WORDS):
     merged = []
     buffer = ""
 
@@ -207,354 +303,404 @@ def clean_segments(sentences, min_words=4):
     return merged
 
 
-def make_sentence_records(transcript_chunks, sentence_splitter):
-    records = []
+def split_sentences_stage(state):
+    if not state or not state.get("transcript_chunks"):
+        raise gr.Error("Transcript is empty. Please check the transcription.")
 
-    for chunk in transcript_chunks:
-        sentences = sentence_splitter.split(chunk["text"])
-        for sentence in clean_segments(sentences, min_words=4):
-            records.append(
-                {
-                    "chunk_start": chunk["start"],
-                    "chunk_end": chunk["end"],
-                    "text": sentence,
-                }
-            )
+    sat = MODELS["sat"]
+    sentences = []
 
-    return records
+    for chunk in state["transcript_chunks"]:
+        text = chunk["text"].strip()
+        if not text:
+            continue
+
+        for sentence in clean_segments(sat.split(text)):
+            sentences.append({
+                "chunk_start": chunk["start"],
+                "chunk_end": chunk["end"],
+                "text": sentence,
+            })
+
+    if not sentences:
+        raise gr.Error("No speech sentences were found in the transcript.")
+
+    state["sentences"] = sentences
+    return state, f"Sentence splitting completed: {len(sentences)} sentences."
 
 
-def classify_sentences(records, classifier, threshold):
-    results = []
-    progress = st.progress(0, text="Classifying transcript sentences...")
+# ---------------------------------------------------------------------
+# GPU stage 4: YAMA classification
+# This function is directly connected to a Gradio event below.
+# ---------------------------------------------------------------------
 
-    for index, record in enumerate(records):
-        try:
-            result = classifier.system_one(
-                record["text"], CLASSIFICATION_QUESTIONS
-            )
-            classification = result["answers"]["classification"]
-            probabilities = classification.get("probabilities", {})
+@spaces.GPU(duration=GPU_DURATION_SECONDS)
+def classify_stage(state, min_confidence, selected_labels,
+                   progress=gr.Progress()):
+    if not state or not state.get("sentences"):
+        raise gr.Error("No sentences are available for classification.")
 
-            prediction = classification.get("choice", "other")
-            confidence = float(classification.get("confidence", 0.0))
-
-            results.append(
-                {
-                    "prediction": prediction,
-                    "confidence": confidence,
-                    "question_prob": float(probabilities.get("question", 0)),
-                    "agreement_prob": float(probabilities.get("agreement", 0)),
-                    "disagreement_prob": float(probabilities.get("disagreement", 0)),
-                    "other_prob": float(probabilities.get("other", 0)),
-                }
-            )
-        except Exception as exc:
-            results.append(
-                {
-                    "prediction": "error",
-                    "confidence": 0.0,
-                    "question_prob": 0.0,
-                    "agreement_prob": 0.0,
-                    "disagreement_prob": 0.0,
-                    "other_prob": 0.0,
-                    "error": str(exc),
-                }
-            )
-
-        progress.progress(
-            (index + 1) / len(records),
-            text=f"Classified sentence {index + 1} of {len(records)}",
+    if MODELS is None:
+        raise gr.Error(
+            "Models failed to load when the Space started:\n"
+            f"{MODEL_LOAD_ERROR}"
         )
 
-    progress.empty()
+    agent = MODELS["agent"]
+    sentences = state["sentences"]
+    classified_rows = []
 
-    classified = pd.DataFrame(
-        [{**record, **result} for record, result in zip(records, results)]
+    for index, item in enumerate(sentences):
+        try:
+            result = agent.system_one(item["text"], QUESTIONS)
+            classification = result["answers"]["classification"]
+            probabilities = classification["probabilities"]
+
+            row = {
+                **item,
+                "prediction": classification["choice"],
+                "confidence": round(float(classification["confidence"]), 3),
+                "question_prob": round(float(probabilities["question"]), 3),
+                "agreement_prob": round(float(probabilities["agreement"]), 3),
+                "disagreement_prob": round(float(probabilities["disagreement"]), 3),
+                "other_prob": round(float(probabilities["other"]), 3),
+            }
+
+        except Exception as exc:
+            print("Classification error:", repr(exc))
+            row = {
+                **item,
+                "prediction": "error",
+                "confidence": 0.0,
+                "question_prob": 0.0,
+                "agreement_prob": 0.0,
+                "disagreement_prob": 0.0,
+                "other_prob": 0.0,
+            }
+
+        classified_rows.append(row)
+
+        progress(
+            (index + 1) / max(len(sentences), 1),
+            desc=f"Classifying sentence {index + 1}/{len(sentences)}",
+        )
+
+    dataframe = pd.DataFrame(classified_rows)
+    if dataframe.empty:
+        counts = pd.DataFrame(columns=["label", "count"])
+    else:
+        counts = (
+            dataframe["prediction"]
+            .value_counts()
+            .rename_axis("label")
+            .reset_index(name="count")
+        )
+
+    highlights = dataframe[
+        dataframe["prediction"].isin(selected_labels)
+        & (dataframe["confidence"] >= min_confidence)
+    ].to_dict(orient="records")
+
+    state["classified_rows"] = classified_rows
+    state["highlights"] = highlights
+
+    return (
+        state,
+        dataframe,
+        counts,
+        f"Classification completed: {len(highlights)} highlight sentences found.",
     )
 
-    if not classified.empty:
-        classified["is_highlight"] = (
-            classified["prediction"].isin(
-                ["question", "agreement", "disagreement"]
-            )
-            & (classified["confidence"] >= threshold)
-        )
 
-    return classified
+# ---------------------------------------------------------------------
+# CPU stage 5: prepare candidates and cut clips
+# ---------------------------------------------------------------------
 
-
-def build_clip_candidates(highlights, clip_duration, video_duration):
+def build_candidates(highlights, clip_len, video_duration):
     candidates = []
 
-    for _, row in highlights.iterrows():
-        highlight_time = (row["chunk_start"] + row["chunk_end"]) / 2
-        start = max(0.0, highlight_time - clip_duration / 2)
-        end = min(video_duration, start + clip_duration)
-        start = max(0.0, end - clip_duration)
+    for row in highlights:
+        midpoint = (row["chunk_start"] + row["chunk_end"]) / 2
+        start = max(0.0, midpoint - clip_len / 2)
+        end = min(video_duration, start + clip_len)
 
-        candidates.append(
-            {
-                "start": start,
-                "end": end,
-                "category": row["prediction"],
-                "text": row["text"],
-            }
-        )
+        if end - start < clip_len:
+            start = max(0.0, end - clip_len)
+
+        candidates.append({
+            "start": start,
+            "end": end,
+            "category": row["prediction"],
+            "text": row["text"],
+        })
 
     candidates.sort(key=lambda item: item["start"])
-    merged = []
 
+    merged = []
     for clip in candidates:
-        if not merged or clip["start"] >= merged[-1]["end"]:
-            merged.append(clip.copy())
-        else:
-            previous = merged[-1]
+        if not merged:
+            merged.append(clip)
+            continue
+
+        previous = merged[-1]
+        if clip["start"] < previous["end"]:
             previous["end"] = max(previous["end"], clip["end"])
             previous["text"] += " " + clip["text"]
-            categories = previous["category"].split(", ")
+
+            categories = set(previous["category"].split(", "))
             if clip["category"] not in categories:
                 previous["category"] += ", " + clip["category"]
+        else:
+            merged.append(clip)
 
     return merged
 
 
-def export_clips(video_path, candidates, output_dir, min_duration, max_duration):
-    check_ffmpeg()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    exported = []
+def cut_clips(video_path, clips, output_dir, min_duration, max_duration):
+    os.makedirs(output_dir, exist_ok=True)
+    saved = []
 
-    for index, clip in enumerate(candidates, start=1):
-        start = clip["start"]
+    for index, clip in enumerate(clips, start=1):
+        start = max(0.0, clip["start"])
         duration = min(clip["end"] - start, max_duration)
 
         if duration < min_duration:
             continue
 
-        output_path = output_dir / f"highlight_{len(exported) + 1:03d}.mp4"
+        output_path = os.path.join(
+            output_dir, f"highlight_{index:03d}.mp4"
+        )
 
         command = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-ss", str(start),
-            "-i", str(video_path),
+            "-i", video_path,
             "-t", str(duration),
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "23",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
             "-c:a", "aac",
             "-movflags", "+faststart",
-            str(output_path),
+            output_path,
         ]
         subprocess.run(command, check=True)
 
-        exported.append(
-            {
-                **clip,
-                "duration": round(duration, 2),
-                "file": output_path,
-            }
+        saved.append({
+            "path": output_path,
+            "label": (
+                f"#{index:03d} | {clip['category']} | "
+                f"{start:.0f}s-{start + duration:.0f}s"
+            ),
+            "start": round(start, 1),
+            "end": round(start + duration, 1),
+            "category": clip["category"],
+            "text": clip["text"],
+        })
+
+    return saved
+
+
+def finish_pipeline(state, clip_len, min_duration, max_duration):
+    if min_duration > max_duration:
+        raise gr.Error(
+            "Minimum clip length cannot be greater than maximum clip length."
         )
 
-    return exported
-
-
-# -------------------------------------------------------------------
-# Sidebar controls
-# -------------------------------------------------------------------
-st.sidebar.header("Settings")
-hf_token_input = st.sidebar.text_input(
-    "Hugging Face token",
-    value=get_hf_token(),
-    type="password",
-    help="Required to download the Indic transcription model. "
-         "You can also set HF_TOKEN in Streamlit secrets.",
-)
-confidence_threshold = st.sidebar.slider(
-    "Minimum classification confidence",
-    min_value=0.0,
-    max_value=1.0,
-    value=0.50,
-    step=0.05,
-)
-clip_duration = st.sidebar.slider(
-    "Target clip duration (seconds)",
-    min_value=30,
-    max_value=60,
-    value=45,
-    step=5,
-)
-min_clip_duration = st.sidebar.number_input(
-    "Minimum exported clip duration (seconds)",
-    min_value=10,
-    max_value=60,
-    value=30,
-    step=5,
-)
-max_clip_duration = st.sidebar.number_input(
-    "Maximum exported clip duration (seconds)",
-    min_value=30,
-    max_value=120,
-    value=60,
-    step=5,
-)
-
-uploaded_video = st.file_uploader(
-    "Upload a podcast or video",
-    type=["mp4", "mov", "mkv", "avi", "webm"],
-)
-
-if uploaded_video is not None:
-    st.video(uploaded_video)
-
-run_button = st.button(
-    "Analyze video and create highlights",
-    type="primary",
-    disabled=uploaded_video is None,
-)
-
-if run_button:
-    if not hf_token_input:
-        st.error("Please provide a Hugging Face token in the sidebar.")
-        st.stop()
-
-    if min_clip_duration > max_clip_duration:
-        st.error("Minimum clip duration cannot exceed maximum clip duration.")
-        st.stop()
+    if not state:
+        raise gr.Error("Pipeline state is missing. Please run the app again.")
 
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            work_dir = Path(temp_dir)
-            video_path = work_dir / f"input{Path(uploaded_video.name).suffix}"
-            audio_path = work_dir / "podcast_audio.wav"
-            output_dir = work_dir / "highlight_clips"
+        highlights = state.get("highlights", [])
+        clips = []
 
-            video_path.write_bytes(uploaded_video.getvalue())
-
-            with st.spinner("Loading models. The first run may take some time..."):
-                asr, sentence_splitter, classifier = load_models(hf_token_input)
-
-            with st.spinner("Extracting audio from the video..."):
-                extract_audio(video_path, audio_path)
-
-            transcript_chunks, video_duration = transcribe_in_chunks(
-                asr, audio_path, chunk_seconds=25
+        if highlights:
+            candidates = build_candidates(
+                highlights,
+                clip_len,
+                state["video_duration"],
+            )
+            clips = cut_clips(
+                state["video_path"],
+                candidates,
+                state["output_dir"],
+                min_duration,
+                max_duration,
             )
 
-            if not any(chunk["text"] for chunk in transcript_chunks):
-                st.warning("The transcription model did not return any text.")
-                st.stop()
+        clips_dataframe = pd.DataFrame(
+            [
+                {key: value for key, value in clip.items() if key != "path"}
+                for clip in clips
+            ],
+            columns=["label", "start", "end", "category", "text"],
+        )
 
-            sentence_records = make_sentence_records(
-                transcript_chunks, sentence_splitter
-            )
+        choices = [(clip["label"], clip["path"]) for clip in clips]
+        first_clip = clips[0]["path"] if clips else None
 
-            if not sentence_records:
-                st.warning("No transcript sentences were detected.")
-                st.stop()
+        status = (
+            f"Done: {len(state.get('sentences', []))} sentences, "
+            f"{len(highlights)} highlight sentences, {len(clips)} clips."
+        )
 
-            classified_df = classify_sentences(
-                sentence_records, classifier, confidence_threshold
-            )
-
-            if classified_df.empty:
-                st.warning("No sentences were available for classification.")
-                st.stop()
-
-            highlights_df = classified_df[
-                classified_df["is_highlight"]
-            ].copy()
-
-            st.session_state["classified_df"] = classified_df
-            st.session_state["highlights_df"] = highlights_df
-
-            st.success("Transcription and classification completed.")
-
-            st.subheader("Classification summary")
-            summary = (
-                classified_df["prediction"]
-                .value_counts()
-                .rename_axis("Category")
-                .reset_index(name="Sentences")
-            )
-            st.dataframe(summary, use_container_width=True, hide_index=True)
-
-            st.subheader("Detected highlights")
-            if highlights_df.empty:
-                st.info(
-                    "No question, agreement, or disagreement sentences met "
-                    "the selected confidence threshold."
-                )
-            else:
-                display_columns = [
-                    "chunk_start", "chunk_end", "text", "prediction",
-                    "confidence", "question_prob", "agreement_prob",
-                    "disagreement_prob",
-                ]
-                st.dataframe(
-                    highlights_df[display_columns],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            st.subheader("Transcript")
-            st.dataframe(
-                classified_df,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            csv_data = classified_df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "Download full classification CSV",
-                data=csv_data,
-                file_name="classified_transcript.csv",
-                mime="text/csv",
-            )
-
-            candidates = build_clip_candidates(
-                highlights_df, clip_duration, video_duration
-            )
-
-            if not candidates:
-                st.info("No highlight clips could be created.")
-            else:
-                with st.spinner("Rendering highlight clips with FFmpeg..."):
-                    exported = export_clips(
-                        video_path,
-                        candidates,
-                        output_dir,
-                        int(min_clip_duration),
-                        int(max_clip_duration),
-                    )
-
-                if not exported:
-                    st.info(
-                        "No clips met the minimum duration. Try a shorter "
-                        "target duration or review the detected highlights."
-                    )
-                else:
-                    st.subheader("Generated highlight clips")
-                    for index, clip in enumerate(exported, start=1):
-                        st.markdown(
-                            f"**Clip {index}** · {clip['category']} · "
-                            f"{clip['start']:.1f}s–{clip['end']:.1f}s"
-                        )
-                        st.caption(clip["text"])
-                        st.video(str(clip["file"]))
-                        st.download_button(
-                            f"Download clip {index}",
-                            data=clip["file"].read_bytes(),
-                            file_name=clip["file"].name,
-                            mime="video/mp4",
-                            key=f"download_clip_{index}",
-                        )
+        return (
+            clips_dataframe,
+            gr.update(choices=choices, value=first_clip),
+            first_clip,
+            [clip["path"] for clip in clips] or None,
+            status,
+        )
 
     except Exception as exc:
-        st.exception(exc)
+        print("Clip extraction error:", repr(exc))
+        raise gr.Error(f"Clip extraction failed: {type(exc).__name__}: {exc}")
 
-st.divider()
-st.caption(
-    "Note: the notebook's clip timestamps are based on 25-second transcription "
-    "chunk ranges, not word-level timestamps. Clips are therefore approximate "
-    "and may start or end between conversational turns."
-)
+
+def show_clip(path):
+    return path
+
+
+# ---------------------------------------------------------------------
+# Gradio UI and chained processing stages
+# ---------------------------------------------------------------------
+
+with gr.Blocks(title="Malayalam Podcast Highlight Finder") as demo:
+    gr.Markdown(
+        "# Malayalam Podcast Highlight Finder\n"
+        "Upload a Malayalam podcast video. The app transcribes it, "
+        "classifies sentences (question / agreement / disagreement / other), "
+        "and extracts highlight clips."
+    )
+
+    pipeline_state = gr.State({})
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            video_input = gr.Video(
+                label="Podcast video",
+                sources=["upload"],
+            )
+
+            labels_input = gr.CheckboxGroup(
+                choices=HIGHLIGHT_LABELS,
+                value=HIGHLIGHT_LABELS,
+                label="Categories to highlight",
+            )
+
+            confidence_input = gr.Slider(
+                0.0, 1.0,
+                value=0.5,
+                step=0.05,
+                label="Minimum confidence",
+            )
+
+            with gr.Accordion("Clip settings", open=False):
+                clip_length_input = gr.Slider(
+                    15, 90,
+                    value=45,
+                    step=5,
+                    label="Clip window around highlight (seconds)",
+                )
+                min_duration_input = gr.Slider(
+                    5, 60,
+                    value=30,
+                    step=5,
+                    label="Minimum clip length (seconds)",
+                )
+                max_duration_input = gr.Slider(
+                    30, 120,
+                    value=60,
+                    step=5,
+                    label="Maximum clip length (seconds)",
+                )
+
+            run_button = gr.Button("Run", variant="primary")
+            status_output = gr.Textbox(label="Status", interactive=False)
+
+        with gr.Column(scale=2):
+            with gr.Tabs():
+                with gr.Tab("Highlight clips"):
+                    clip_select = gr.Dropdown(
+                        label="Select clip",
+                        choices=[],
+                    )
+                    clip_player = gr.Video(label="Clip preview")
+                    clips_files = gr.Files(label="Download clips")
+                    clips_table = gr.Dataframe(
+                        label="Clip details",
+                        wrap=True,
+                    )
+
+                with gr.Tab("Classified sentences"):
+                    counts_output = gr.Dataframe(label="Label counts")
+                    classified_output = gr.Dataframe(
+                        label="All sentences",
+                        wrap=True,
+                    )
+
+                with gr.Tab("Transcript"):
+                    transcript_output = gr.Textbox(
+                        label="Transcript",
+                        lines=18,
+                        interactive=False,
+                    )
+
+    # CPU: extract audio and split into chunks.
+    prepare_event = run_button.click(
+        fn=prepare_video,
+        inputs=[video_input],
+        outputs=[pipeline_state, status_output],
+    )
+
+    # GPU: transcribe. The decorated function is directly registered
+    # as a Gradio event handler, as required by ZeroGPU.
+    transcription_event = prepare_event.then(
+        fn=transcribe_stage,
+        inputs=[pipeline_state],
+        outputs=[pipeline_state, transcript_output, status_output],
+    )
+
+    # CPU: sentence segmentation.
+    sentence_event = transcription_event.then(
+        fn=split_sentences_stage,
+        inputs=[pipeline_state],
+        outputs=[pipeline_state, status_output],
+    )
+
+    # GPU: classify sentences.
+    classification_event = sentence_event.then(
+        fn=classify_stage,
+        inputs=[pipeline_state, confidence_input, labels_input],
+        outputs=[
+            pipeline_state,
+            classified_output,
+            counts_output,
+            status_output,
+        ],
+    )
+
+    # CPU: cut clips and prepare outputs.
+    classification_event.then(
+        fn=finish_pipeline,
+        inputs=[
+            pipeline_state,
+            clip_length_input,
+            min_duration_input,
+            max_duration_input,
+        ],
+        outputs=[
+            clips_table,
+            clip_select,
+            clip_player,
+            clips_files,
+            status_output,
+        ],
+    )
+
+    clip_select.change(
+        fn=show_clip,
+        inputs=clip_select,
+        outputs=clip_player,
+    )
+
+
+if __name__ == "__main__":
+    demo.queue().launch()
