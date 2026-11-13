@@ -8,3 +8,4 @@ soundfile
 numpy
 pandas
 wtpsplit
+spaces

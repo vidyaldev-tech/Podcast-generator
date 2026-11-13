@@ -25,7 +25,7 @@ Requirements (requirements.txt):
 System packages (packages.txt for HF Spaces):
   ffmpeg
 """
-
+import spaces
 import os
 import shutil
 import subprocess
@@ -284,6 +284,7 @@ def cut_clips(video_path, clips, out_dir, min_dur, max_dur):
 # --------------------------------------------------------------------------
 # Gradio handler
 # --------------------------------------------------------------------------
+@spaces.GPU
 def run_pipeline(video_path, min_conf, labels, clip_len, min_dur, max_dur,
                  progress=gr.Progress()):
     if not video_path:
