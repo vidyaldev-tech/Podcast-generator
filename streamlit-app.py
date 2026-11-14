@@ -159,9 +159,19 @@ def load_models():
 
         st.write("6. Loading classification model...")
 
-        models["agent"] = thx01.load(CLASSIFIER_MODEL)
+        try:
+            print("Starting classifier loading...", flush=True)
 
-        st.success("Classification model loaded!")
+            models["agent"] = thx01.load(CLASSIFIER_MODEL)
+
+            print("Classifier loaded successfully!", flush=True)
+            st.success("Classification model loaded successfully!")
+
+        except Exception as e:
+            print(f"Classifier loading failed: {type(e).__name__}: {e}", flush=True)
+            st.error(f"Classifier loading failed: {type(e).__name__}: {e}")
+            st.exception(e)
+            raise
 
         models["device"] = device
 
