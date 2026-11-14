@@ -74,46 +74,103 @@ QUESTIONS = {
 # Load models once and cache them
 # --------------------------------------------------
 
-@st.cache_resource(show_spinner="Loading AI models...")
+# @st.cache_resource(show_spinner="Loading AI models...")
+# def load_models():
+
+#     if HF_TOKEN:
+#         login(
+#             token=HF_TOKEN,
+#             add_to_git_credential=False
+#         )
+
+#     model_dir = snapshot_download(
+#         repo_id=ASR_MODEL,
+#         token=HF_TOKEN
+#     )
+
+#     if model_dir not in sys.path:
+#         sys.path.insert(0, model_dir)
+
+#     from indic_transcribe import IndicTranscribe
+
+#     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+#     asr = IndicTranscribe.from_pretrained(model_dir)
+
+#     sat = SaT(SAT_MODEL)
+
+#     agent = thx01.load(CLASSIFIER_MODEL)
+
+#     # Move models only if their wrappers expose .to()
+#     if hasattr(asr, "to"):
+#         asr.to(device)
+
+#     if hasattr(agent, "to"):
+#         agent.to(device)
+
+#     return {
+#         "asr": asr,
+#         "sat": sat,
+#         "agent": agent,
+#         "device": device
+#     }
+
+@st.cache_resource(show_spinner=False)
 def load_models():
 
-    if HF_TOKEN:
-        login(
-            token=HF_TOKEN,
-            add_to_git_credential=False
+    models = {}
+
+    try:
+        st.write("1. Checking Hugging Face authentication...")
+
+        if HF_TOKEN:
+            login(
+                token=HF_TOKEN,
+                add_to_git_credential=False
+            )
+
+        st.write("2. Downloading Indic Transcribe model...")
+
+        model_dir = snapshot_download(
+            repo_id=ASR_MODEL,
+            token=HF_TOKEN
         )
 
-    model_dir = snapshot_download(
-        repo_id=ASR_MODEL,
-        token=HF_TOKEN
-    )
+        if model_dir not in sys.path:
+            sys.path.insert(0, model_dir)
 
-    if model_dir not in sys.path:
-        sys.path.insert(0, model_dir)
+        st.write("3. Importing Indic Transcribe...")
 
-    from indic_transcribe import IndicTranscribe
+        from indic_transcribe import IndicTranscribe
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    asr = IndicTranscribe.from_pretrained(model_dir)
+        st.write(f"4. Loading ASR model on {device}...")
 
-    sat = SaT(SAT_MODEL)
+        models["asr"] = IndicTranscribe.from_pretrained(model_dir)
 
-    agent = thx01.load(CLASSIFIER_MODEL)
+        st.success("ASR model loaded!")
 
-    # Move models only if their wrappers expose .to()
-    if hasattr(asr, "to"):
-        asr.to(device)
+        st.write("5. Loading sentence segmentation model...")
 
-    if hasattr(agent, "to"):
-        agent.to(device)
+        models["sat"] = SaT(SAT_MODEL)
 
-    return {
-        "asr": asr,
-        "sat": sat,
-        "agent": agent,
-        "device": device
-    }
+        st.success("Sentence segmentation model loaded!")
+
+        st.write("6. Loading classification model...")
+
+        models["agent"] = thx01.load(CLASSIFIER_MODEL)
+
+        st.success("Classification model loaded!")
+
+        models["device"] = device
+
+        return models
+
+    except Exception as e:
+        st.error(f"Model loading failed: {type(e).__name__}: {e}")
+        st.exception(e)
+        raise
 
 
 # --------------------------------------------------
@@ -613,7 +670,7 @@ if uploaded_video:
         "Find Highlights",
         type="primary"
     ):
-
+        
         if not selected_labels:
             st.error("Select at least one category.")
 
