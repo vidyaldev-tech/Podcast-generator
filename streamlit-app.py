@@ -23,7 +23,8 @@ import thx01
 
 ASR_MODEL = "bodhan-ai/indic-transcribe-core"
 SAT_MODEL = "sat-3l-sm"
-CLASSIFIER_MODEL = "LatentAILabs/yama-indic"
+# CLASSIFIER_MODEL = "LatentAILabs/yama-indic"
+CLASSIFIER_MODEL = "LatentAILabs/laya-indic"
 
 SAMPLE_RATE = 16000
 CHUNK_SECONDS = 25
