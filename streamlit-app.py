@@ -23,8 +23,8 @@ import thx01
 
 ASR_MODEL = "bodhan-ai/indic-transcribe-core"
 SAT_MODEL = "sat-3l-sm"
-# CLASSIFIER_MODEL = "LatentAILabs/yama-indic"
-CLASSIFIER_MODEL = "LatentAILabs/laya-indic"
+CLASSIFIER_MODEL = "LatentAILabs/yama-indic"
+# CLASSIFIER_MODEL = "LatentAILabs/laya-indic"
 
 SAMPLE_RATE = 16000
 CHUNK_SECONDS = 25
@@ -42,7 +42,7 @@ QUESTIONS = {
     "classification": {
         "type": "choice",
         "instructions": """
-        Classify the conversational function of this Malayalam
+        Classify the conversational function of this
         podcast transcript sentence.
 
         Classify based on actual conversational meaning.
@@ -613,15 +613,15 @@ def cut_clips(
 # --------------------------------------------------
 
 st.set_page_config(
-    page_title="Malayalam Podcast Highlight Finder",
+    page_title=" Podcast Highlight Finder",
     page_icon="🎬",
     layout="wide"
 )
 
-st.title("🎬 Malayalam Podcast Highlight Finder")
+st.title("🎬  Podcast Highlight Finder")
 
 st.write(
-    "Upload a Malayalam podcast video to transcribe, "
+    "Upload a  podcast video to transcribe, "
     "classify and extract interesting clips."
 )
 
